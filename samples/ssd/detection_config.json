@@ -1,0 +1,29 @@
+{
+    "source" : {
+        "parallelism" : 0,
+        "max_input_queue_size" : 0,
+        "class_name" : "ModuleDataSource",
+        "next_modules" : ["detector"],
+        "custom_params" : {
+            "device_id" : 0
+        }
+    },
+
+    "detector" : {
+        "class_name" : "InferenceModule",
+        "parallelism" : 1,
+        "max_input_queue_size" : 20,
+        "next_modules" : ["fps_stats"],
+        "custom_params" : {
+            "model_path" : "/home/Cambricon-MLU270/caffe/src/.caffe/examples/ssd_caffe/models/ssdvgg300.cambricon",
+            "threshold" : 0.5,
+            "device_id" : 0
+        }
+    },
+
+    "fps_stats" : {
+        "class_name" : "cnstream::FpsStats",
+        "parallelism" : 2,
+        "max_input_queue_size" : 20
+    }
+}
