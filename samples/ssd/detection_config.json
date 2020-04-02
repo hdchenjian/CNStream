@@ -11,7 +11,7 @@
 
     "detector" : {
         "class_name" : "InferenceModule",
-        "parallelism" : 1,
+        "parallelism" : 6,
         "max_input_queue_size" : 20,
         "next_modules" : ["fps_stats"],
         "custom_params" : {

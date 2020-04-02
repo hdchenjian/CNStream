@@ -5,6 +5,7 @@
 #include <list>
 #include <string>
 #include <vector>
+#include <sys/time.h>
 
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
@@ -15,12 +16,19 @@
 #include "/usr/local/neuware/include/cnrt.h"
 
 bool LOG_ON = false;
-cnstream::FpsStats* gfps_stats = nullptr;
-static std::mutex print_mutex;
+
+double what_time_is_it_now()
+{
+    struct timeval time;
+    if (gettimeofday(&time,NULL)){
+        return 0;
+    }
+    return (double)time.tv_sec + (double)time.tv_usec * .000001;
+}
 
 class SsdNet {
 public:
-    SsdNet(std::string offmodel);
+    SsdNet(std::string model_path);
     void run_network(cv::Mat &img1, std::vector<std::vector<float>> &detections);
 
     cnrtModel_t model_;
@@ -36,8 +44,11 @@ public:
     void** outputMluPtrS;
     int in_n_, in_c_, in_h_, in_w_;
     int *out_n_, *out_c_, *out_h_, *out_w_;
-    void **output_data_cast;
-    float **outputCpu;
+    void* cpu_input_data_cast;
+    float* cpu_input_data;
+    void** net_param;
+    void** output_data_cast;
+    float** outputCpu;
     int out_count_;
 
     ~SsdNet() {
@@ -56,20 +67,23 @@ public:
         free(out_w_);
         free(output_data_cast);
         free(outputCpu);
+        free(cpu_input_data_cast);
+        free(cpu_input_data);
+        free(net_param);
         //std::cout << "~SsdNet" << std::endl;
     }
 };
 
-SsdNet::SsdNet(std::string offmodel){
+SsdNet::SsdNet(std::string model_path){
     int dev_id_ = 0;
-    cnrtLoadModel(&model_, offmodel.c_str());
+    cnrtLoadModel(&model_, model_path.c_str());
     std::string name = "subnet0";
 
     cnrtDev_t dev;
     CNRT_CHECK(cnrtGetDeviceHandle(&dev, dev_id_));
     CNRT_CHECK(cnrtSetCurrentDevice(dev));
     if (LOG_ON) {
-        std::cout << "Init Classifier for device " << dev_id_ << std::endl;
+        std::cout << "Init SsdNet for device " << dev_id_ << std::endl;
     }
 
     CNRT_CHECK(cnrtCreateFunction(&(function_)));
@@ -118,6 +132,12 @@ SsdNet::SsdNet(std::string offmodel){
                   << " W: " << in_w_ << " C: " << in_c_ << std::endl;
     }
 
+    int input_size = in_n_ * in_h_ * in_w_ * in_c_;
+    cpu_input_data_cast = malloc(cnrtDataTypeSize(CNRT_FLOAT16) * input_size);
+    cpu_input_data = (float *)malloc(input_size * sizeof(float));
+    net_param = (void**)malloc((inputNum_ + outputNum_) * sizeof(void *));
+
+
     output_data_cast = (void **)malloc(sizeof(void **) * outputNum_);
     outputCpu = (float**)malloc(sizeof(float*) * outputNum_);
     out_n_ = (int *)malloc(sizeof(int) * outputNum_);
@@ -141,23 +161,19 @@ SsdNet::SsdNet(std::string offmodel){
 }
 
 void SsdNet::run_network(cv::Mat &image, std::vector<std::vector<float>> &detections) {
-    int input_size = in_n_ * in_h_ * in_w_ * in_c_;
-    void* cpu_data_cast_type = malloc(cnrtDataTypeSize(CNRT_FLOAT16) * input_size);
     if (LOG_ON) {
         std::cout << "image w x h x c: " << image.cols << " x " << image.rows
                   << " x " << image.channels() << std::endl;
     }
-
     cv::Mat img;
     cv::resize(image, img, cv::Size(in_w_, in_h_));
     cv::Mat img_float;
     img.convertTo(img_float, CV_32FC3);
 
-    float *cpu_data_ = (float *)malloc(input_size * sizeof(float));
     int channels = img.channels();
     float mean_value[3] = {104.0F, 117.0F, 123.0F};
     for(int k = 0; k < channels; ++k){
-        float *cpu_data_ptr = cpu_data_ + k * img.rows * img.cols;
+        float *cpu_data_ptr = cpu_input_data + k * img.rows * img.cols;
         for(int i = 0; i < img.rows; ++i){
             for(int j = 0; j < img.cols; ++j){
                 cpu_data_ptr[i * img.cols + j] = img_float.at<cv::Vec3f>(i, j)[k] - mean_value[k];
@@ -167,30 +183,28 @@ void SsdNet::run_network(cv::Mat &image, std::vector<std::vector<float>> &detect
     int dim_values[4] = {in_n_, in_c_, in_h_, in_w_};
     int dim_order[4] = {0, 2, 3, 1};  // NCHW --> NHWC
 
-    CNRT_CHECK(cnrtTransOrderAndCast(cpu_data_, CNRT_FLOAT32,
-                                     cpu_data_cast_type, CNRT_FLOAT16,
+    CNRT_CHECK(cnrtTransOrderAndCast(cpu_input_data, CNRT_FLOAT32,
+                                     cpu_input_data_cast, CNRT_FLOAT16,
                                      nullptr, 4, dim_values, dim_order));
-    //CNRT_CHECK(cnrtCastDataType(cpu_data_, CNRT_FLOAT32,
-    //                            cpu_data_cast_type, CNRT_FLOAT16, input_size, nullptr));
-    CNRT_CHECK(cnrtMemcpy(inputMluPtrS[0], cpu_data_cast_type,
+    //CNRT_CHECK(cnrtCastDataType(cpu_input_data, CNRT_FLOAT32,
+    //                            cpu_input_data_cast, CNRT_FLOAT16, input_size, nullptr));
+    CNRT_CHECK(cnrtMemcpy(inputMluPtrS[0], cpu_input_data_cast,
                           inputSizeS_[0], CNRT_MEM_TRANS_DIR_HOST2DEV));
-    free(cpu_data_cast_type);
-    free(cpu_data_);
 
-    void* param[inputNum_ + outputNum_];
     for (int j = 0; j < inputNum_; j++) {
-        param[j] = inputMluPtrS[j];
+        net_param[j] = inputMluPtrS[j];
     }
     for (int j = 0; j < outputNum_; j++) {
-        param[inputNum_ + j] = outputMluPtrS[j];
+        net_param[inputNum_ + j] = outputMluPtrS[j];
     }
 
-    CNRT_CHECK(cnrtInvokeRuntimeContext(runtime_ctx_, param, queue_, nullptr));
+    CNRT_CHECK(cnrtInvokeRuntimeContext(runtime_ctx_, net_param, queue_, nullptr));
 
     if (cnrtSyncQueue(queue_) == CNRT_RET_SUCCESS) {
         //std::cout << "SyncStream success" << std::endl;
     } else {
         std::cout << "SyncStream error" << std::endl;
+        return;
     }
 
     for (int j = 0; j < outputNum_; j++){
@@ -262,49 +276,65 @@ public:
         std::cout << this->GetName() << " Open called" << std::endl;
         for (auto &v : paramSet) {
             std::cout << "\t" << v.first << " : " << v.second << std::endl;
-            continue;
-            /*
-              if(0 == v.first.compare("model_path")) model_path = v.second;
-              else if(0 == v.first.compare("threshold")) threshold = std::stof(v.second);
-              else if(0 == v.first.compare("device_id")) device_id = std::stoi(v.second);
-            */
+            if(0 == v.first.compare("model_path")) model_path = v.second;
+            else if(0 == v.first.compare("threshold")) threshold = std::stof(v.second);
+            else if(0 == v.first.compare("device_id")) device_id = std::stoi(v.second);
         }
         return true;
     }
-    void Close() override { std::cout << this->GetName() << " Close called" << std::endl; }
+    void Close() override {
+        std::cout << this->GetName() << " Close called" << std::endl;
+        for(std::map<std::thread::id, SsdNet*>::iterator it = ssd_nets.begin(); it != ssd_nets.end(); it++){
+            delete it->second;
+        }
+        ssd_nets.clear();
+    }
     int Process(std::shared_ptr<cnstream::CNFrameInfo> data) override {
         std::thread::id thread_id = std::this_thread::get_id();
-        //std::unique_lock<std::mutex> lock(print_mutex);
-        std::cout << this->GetName() << " process: " << data->frame.stream_id << "--" << data->frame.frame_id;
-        std::cout << " : " << thread_id << std::endl;
-        return 0;
+        //std::cout << this->GetName() << " process: " << data->frame.stream_id << "--"
+        //          << data->frame.frame_id << " : " << thread_id << std::endl;
 
-        /*
-          std::map<std::thread::id, SsdNet*>::iterator it = ssd_nets.find(thread_id);
-          if (it == ssd_nets.end()){
-          LOG(INFO) << "[InferenceModule Process] init SsdNet";
-          //SsdNet* launcher = new SsdNet(model_path);
-          }
-        */
+        SsdNet* ssd;
+        std::map<std::thread::id, SsdNet*>::iterator it = ssd_nets.find(thread_id);
+        bool show_detection_result = false;
+        if (it == ssd_nets.end()){
+            std::cout << "[InferenceModule Process] init SsdNet" << std::endl;
+            ssd = new SsdNet(model_path);
+            ssd_nets[thread_id] = ssd;
+            show_detection_result = true;
+        } else {
+            ssd = ssd_nets[thread_id];
+        }
+        std::vector<std::vector<float>> detections;
+        cv::Mat image(data->frame.height, data->frame.width, CV_8UC3, data->frame.ptr_cpu[0]);
+        ssd->run_network(image,detections);
+        if(show_detection_result){
+            const char *label_to_name[] = {"background","aeroplane","bicycle","bird","boat","bottle",
+                                           "bus","car","cat","chair","cow","diningtable","dog","horse",
+                                           "motorbike","person","pottedplant","sheep","sofa","train","tvmonitor"};
+            for(int i = 0; i < detections.size(); i++){
+                std::cout << "detection_result label: " << label_to_name[(int)detections[i][1]]
+                          << " score: " << detections[i][2] << " bbox: "
+                          << detections[i][3] << " " << detections[i][4] << " "
+                          << detections[i][5] << " " << detections[i][6] << std::endl;
+            }
+        }
         return 0;
     }
 
 private:
     InferenceModule(const InferenceModule &) = delete;
     InferenceModule &operator=(InferenceModule const &) = delete;
-    //static std::mutex print_mutex;
-    //static std::map<std::thread::id, SsdNet*> ssd_nets;
-    //std::string model_path;
-    //float threshold = 0.5F;
-    //int device_id = 0;
+    static std::map<std::thread::id, SsdNet*> ssd_nets;
+    std::string model_path;
+    float threshold = 0.5F;
+    int device_id = 0;
 };
-//std::mutex InferenceModule::print_mutex;
-//std::map<std::thread::id, SsdNet*> InferenceModule::ssd_nets;
+std::map<std::thread::id, SsdNet*> InferenceModule::ssd_nets;
 
 class PipelineWatcher {
 public:
-    explicit PipelineWatcher(cnstream::Pipeline* pipeline) : pipeline_(pipeline) {
-        LOG_IF(FATAL, pipeline == nullptr) << "pipeline is null.";
+    explicit PipelineWatcher(cnstream::FpsStats* gfps_stats_) : gfps_stats(gfps_stats_) {
     }
 
     void SetDuration(int ms) { duration_ = ms; }
@@ -330,7 +360,8 @@ public:
 private:
     void ThreadFunc() {
         while (running_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(duration_));
+            std::this_thread::sleep_for(std::chrono::milliseconds(duration_ / 2));
+            if(!running_) break;
             if (gfps_stats) {
                 gfps_stats->ShowStatistics();
             } else {
@@ -340,9 +371,9 @@ private:
     }
     bool running_ = false;
     std::thread thread_;
-    int duration_ = 2000;  // ms
-    cnstream::Pipeline* pipeline_ = nullptr;
-};  // class Pipeline Watcher
+    int duration_ = 5000;  // ms
+    cnstream::FpsStats* gfps_stats = nullptr;
+};
 
 class MsgObserver : cnstream::StreamMsgObserver {
 public:
@@ -352,9 +383,9 @@ public:
         if (stop_) return;
         if (smsg.type == cnstream::StreamMsgType::EOS_MSG) {
             eos_chn_.push_back(smsg.chn_idx);
-            LOG(INFO) << "[Observer] received EOS from channel:" << smsg.chn_idx;
+            std::cout << "[Observer] received EOS from channel:" << smsg.chn_idx << std::endl;
             if (static_cast<int>(eos_chn_.size()) == chn_cnt_) {
-                LOG(INFO) << "[Observer] received all EOS";
+                std::cout << "[Observer] received all EOS" << std::endl;
                 stop_ = true;
                 wakener_.set_value(0);
             }
@@ -384,13 +415,20 @@ int main(int argc, char** argv) {
 
     std::cout << "\033[01;31m"
               << "CNSTREAM VERSION:" << cnstream::VersionString() << "\033[0m" << std::endl;
+    unsigned int real_dev_num;
+    cnrtInit(0);
+    cnrtGetDeviceCount(&real_dev_num);
+    if (real_dev_num == 0) {
+        std::cerr << "only have " << real_dev_num << " device(s) " << std::endl;
+        cnrtDestroy();
+        return -1;
+    }
 
-    std::cout << "Build pipeline start 1\n" ;
     cnstream::Pipeline pipeline("pipeline");
     int build_ret = pipeline.BuildPipelineByJSONFile("detection_config.json");
     std::cout << "Build pipeline " << build_ret << std::endl;
 
-    int stream_num = 1;
+    int stream_num = 6;
     MsgObserver msg_observer(stream_num, &pipeline);
     pipeline.SetStreamMsgObserver(reinterpret_cast<cnstream::StreamMsgObserver*>(&msg_observer));
 
@@ -404,17 +442,23 @@ int main(int argc, char** argv) {
         LOG(ERROR) << "Pipeline start failed.";
         return EXIT_FAILURE;
     }
+    /* watcher, for rolling print */
+    cnstream::FpsStats* gfps_stats = dynamic_cast<cnstream::FpsStats*>(pipeline.GetModule("fps_stats"));
+    PipelineWatcher watcher(gfps_stats);
+    watcher.Start();
+    double start = what_time_is_it_now();
 
     std::vector<std::thread> threads;
     cv::Mat img = cv::imread("test.jpg");
     cnstream::DevContext dev_ctx_;
     dev_ctx_.dev_type = cnstream::DevContext::MLU;
     dev_ctx_.dev_id = 0;
+    int times = 1000;
     for (int j = 0; j < stream_num; j++) {
         threads.push_back(std::thread([&, j]() {
                     std::string stream_id("stream_id_");
                     stream_id += std::to_string(j);
-                    for (int i = 0; i < 10; i++) {
+                    for (int i = 0; i < times; i++) {
                         std::shared_ptr<cnstream::CNFrameInfo> data = cnstream::CNFrameInfo::Create(stream_id);
                         cnstream::CNDataFrame &frame = data->frame;
                         data->channel_idx = j;
@@ -425,7 +469,8 @@ int main(int argc, char** argv) {
                         frame.stride[0] = img.step;
                         data->frame.frame_id = i;
                         frame.timestamp = 1000;
-                        frame.ptr_mlu[0] = img.data;
+                        //frame.ptr_mlu[0] = img.data;
+                        frame.ptr_cpu[0] = img.data;
                         pipeline.ProvideData(source, data);
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
@@ -440,14 +485,12 @@ int main(int argc, char** argv) {
     }
     std::cout << "ProvideData joined"  << std::endl;
 
-    /* watcher, for rolling print */
-    gfps_stats = dynamic_cast<cnstream::FpsStats*>(pipeline.GetModule("fps_stats"));
-    PipelineWatcher watcher(&pipeline);
-    watcher.Start();
-
     msg_observer.WaitForStop();
-    watcher.Stop();
     if (gfps_stats) gfps_stats->ShowStatistics();
+    watcher.Stop();
+    double end = what_time_is_it_now();
+    printf("\nmain spend %f seconds, %f fps \n", end - start, (stream_num * times) / (end - start));
     google::ShutdownGoogleLogging();
+    cnrtDestroy();
     return EXIT_SUCCESS;
 }
