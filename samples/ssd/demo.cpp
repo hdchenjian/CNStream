@@ -486,10 +486,10 @@ int main(int argc, char** argv) {
     std::cout << "ProvideData joined"  << std::endl;
 
     msg_observer.WaitForStop();
+    double end = what_time_is_it_now();
     if (gfps_stats) gfps_stats->ShowStatistics();
     watcher.Stop();
-    double end = what_time_is_it_now();
-    printf("\nmain spend %f seconds, %f fps \n", end - start, (stream_num * times) / (end - start));
+    printf("\n main thread spend %f seconds, %f fps \n", end - start, (stream_num * times) / (end - start));
     google::ShutdownGoogleLogging();
     cnrtDestroy();
     return EXIT_SUCCESS;
