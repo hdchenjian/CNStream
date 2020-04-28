@@ -6,7 +6,7 @@
 #include "cnrt.h"
 #include "jpeg_decode_context.h"
 
-int times = 1;
+int times = 10;
 
 double what_time_is_it_now()
 {
@@ -21,13 +21,13 @@ static void* decodeProc(void *argv){
     JpegDecodeContext &ctx = *(reinterpret_cast<JpegDecodeContext *>(argv));
     int device_id = 0;
     double start = what_time_is_it_now();
-    for(int i = 0; i < times; i++){
-        if (!ctx.Create()) {
-            return nullptr;
-        }
-        ctx.RunOneDecodeRound();
-        ctx.Destroy();
+    if (!ctx.Create()) {
+        return nullptr;
     }
+    for(int i = 0; i < times; i++){
+        ctx.RunOneDecodeRound();
+    }
+    ctx.Destroy();
     double end = what_time_is_it_now();
     printf("\n thread %d spend %f seconds, %f fps \n", ctx.decode_instance_id, end - start, times / (end - start));
     return nullptr;

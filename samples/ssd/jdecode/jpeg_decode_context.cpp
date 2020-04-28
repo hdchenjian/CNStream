@@ -505,11 +505,13 @@ bool JpegDecodeContext::Decode(char *data, int len) {
     //printf("colorSpace %d\n", output.frame.colorSpace);  // CNCODEC_COLOR_SPACE_BT_709
     //printf("w %d h %d planeNum %d\n", output.frame.width, output.frame.height, output.frame.planeNum);
     char* image_data = (char *)malloc((output.frame.plane[0].size + output.frame.plane[1].size) * sizeof(char));
+    static int image_index = 1000;
     if(GetFrameData(output.frame, image_data)){
         cv::Mat img = cv::Mat(output.frame.height * 3 / 2, output.frame.width, CV_8UC1, image_data);
         cv::Mat bgr(output.frame.height, output.frame.width, CV_8UC3);
         cv::cvtColor(img, bgr, cv::COLOR_YUV2BGR_NV12);
-        cv::imwrite("yuv.jpg", bgr);
+        cv::imwrite("yuv" + std::to_string(image_index) + ".jpg", bgr);
+        image_index += 1;
     } else {
         printf("GetFrameData fail");
         return false;
